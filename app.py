@@ -9,7 +9,7 @@ import graphviz
 st.set_page_config(page_title="DES Factory Twin", layout="wide")
 
 st.title("🏭 Multi-Stage DES: Financial & Flow Twin")
-st.markdown("This digital twin merges physical factory physics (queues, variance, throughput) with the C-Suite financial reality. Tinker with the parameters to see how bottlenecks form and how they impact the bottom line.")
+st.markdown("This digital twin merges physical factory physics (queues, variance, throughput) with the C-Suite financial reality. The Economic view allocates all CAPEX, OPEX, and holding penalties down to the **Per-Unit Level**.")
 
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
@@ -59,8 +59,6 @@ if run_sim:
     mc_throughput = []
     mc_lead_times = []
     sample_queue_data = []
-    
-    # Store aggregate queue stats to inject into the diagram
     q1_avgs, q2_avgs, q3_avgs = [], [], []
 
     def part_journey(env, stages, metrics):
@@ -133,10 +131,7 @@ if run_sim:
     # --- AGGREGATE METRICS ---
     avg_throughput = np.mean(mc_throughput)
     avg_lead_time = np.mean(mc_lead_times) if mc_lead_times else 0
-    
-    avg_q1 = np.mean(q1_avgs)
-    avg_q2 = np.mean(q2_avgs)
-    avg_q3 = np.mean(q3_avgs)
+    avg_q1, avg_q2, avg_q3 = np.mean(q1_avgs), np.mean(q2_avgs), np.mean(q3_avgs)
     grand_avg_wip = avg_q1 + avg_q2 + avg_q3
 
     # --- FINANCIAL MATH ---
@@ -148,15 +143,36 @@ if run_sim:
     weekly_wip_penalty = grand_avg_wip * wip_cost_per_unit
     
     weekly_gross_profit = weekly_revenue - weekly_rm_cost - weekly_opex - weekly_wip_penalty
-    annual_gross_profit = weekly_gross_profit * 52
-    payback_period = (total_capex / annual_gross_profit) * 12 if annual_gross_profit > 0 else float('inf')
+    payback_period = (total_capex / (weekly_gross_profit * 52)) * 12 if weekly_gross_profit > 0 else float('inf')
 
     # --- GRAPHVIZ GENERATOR FUNCTIONS ---
     def generate_vsm(view_type="ops"):
         dot = graphviz.Digraph(node_attr={'shape': 'box', 'style': 'filled', 'color': '#E1E4E8', 'fontname': 'Helvetica'})
-        dot.attr(rankdir='LR', splines='ortho') # Orthogonal lines for schematic look
+        dot.attr(rankdir='LR', splines='ortho')
         
-        # Define Buffers (Queues)
+        # ACTIVITY-BASED COSTING MATH
+        # Guard against zero division if nothing processes
+        tp = max(1, avg_throughput) 
+        
+        # Buffer Penalties per Unit
+        b1_pu = (avg_q1 * wip_cost_per_unit) / tp
+        b2_pu = (avg_q2 * wip_cost_per_unit) / tp
+        b3_pu = (avg_q3 * wip_cost_per_unit) / tp
+        
+        # Station Costs per Unit (Allocated evenly across parallel machines)
+        # Amortizing CAPEX over 520 weeks (10 years)
+        m1_op_pu = (m1_qty * opex_m1) / tp if m1_qty > 0 else 0
+        m1_cap_pu = ((m1_qty * capex_m1) / 520) / tp if m1_qty > 0 else 0
+        
+        m2_op_pu = (m2_qty * opex_m2) / tp if m2_qty > 0 else 0
+        m2_cap_pu = ((m2_qty * capex_m2) / 520) / tp if m2_qty > 0 else 0
+        
+        m3_op_pu = (m3_qty * opex_m3) / tp if m3_qty > 0 else 0
+        m3_cap_pu = ((m3_qty * capex_m3) / 520) / tp if m3_qty > 0 else 0
+        
+        total_cost_pu = rm_cost + b1_pu + b2_pu + b3_pu + m1_op_pu + m1_cap_pu + m2_op_pu + m2_cap_pu + m3_op_pu + m3_cap_pu
+        net_margin_pu = unit_revenue - total_cost_pu
+
         if view_type == "ops":
             dot.node('IN', f'Raw Materials\nArrival: {arrival_rate}m', color='#cce5ff', shape='folder')
             dot.node('B1', f'WIP Buffer 1\nAvg: {avg_q1:.1f} parts', color='#fff3cd', shape='cylinder')
@@ -164,38 +180,34 @@ if run_sim:
             dot.node('B3', f'WIP Buffer 3\nAvg: {avg_q3:.1f} parts', color='#fff3cd', shape='cylinder')
             dot.node('OUT', f'Finished Goods\nThroughput: {avg_throughput:.0f}/wk\nLead Time: {avg_lead_time:.1f}m', color='#d4edda', shape='folder')
         else:
-            dot.node('IN', f'Raw Materials\nUnit Cost: £{rm_cost}', color='#cce5ff', shape='folder')
-            dot.node('B1', f'WIP Buffer 1\nHolding Cost: £{avg_q1 * wip_cost_per_unit:,.0f}/wk', color='#f8d7da', shape='cylinder')
-            dot.node('B2', f'WIP Buffer 2\nHolding Cost: £{avg_q2 * wip_cost_per_unit:,.0f}/wk', color='#f8d7da', shape='cylinder')
-            dot.node('B3', f'WIP Buffer 3\nHolding Cost: £{avg_q3 * wip_cost_per_unit:,.0f}/wk', color='#f8d7da', shape='cylinder')
-            dot.node('OUT', f'Finished Goods\nUnit Rev: £{unit_revenue}\nGross Margin: £{weekly_gross_profit:,.0f}/wk', color='#d4edda', shape='folder')
+            dot.node('IN', f'Raw Materials\n£{rm_cost:.2f} / unit', color='#cce5ff', shape='folder')
+            dot.node('B1', f'WIP Buffer 1\nPenalty: £{b1_pu:.2f} / unit', color='#f8d7da', shape='cylinder')
+            dot.node('B2', f'WIP Buffer 2\nPenalty: £{b2_pu:.2f} / unit', color='#f8d7da', shape='cylinder')
+            dot.node('B3', f'WIP Buffer 3\nPenalty: £{b3_pu:.2f} / unit', color='#f8d7da', shape='cylinder')
+            dot.node('OUT', f'Finished Goods\nCost: £{total_cost_pu:.2f} / unit\nMargin: £{net_margin_pu:.2f} / unit', color='#d4edda', shape='folder')
 
-        # Connect In -> Buffer 1
         dot.edge('IN', 'B1')
         
-        # Parallel Milling Nodes
         with dot.subgraph() as s1:
             s1.attr(rank='same')
             for i in range(m1_qty):
-                label = f'Milling {i+1}\nμ={m1_mu}m, σ={m1_sig}m' if view_type == "ops" else f'Milling {i+1}\nCAPEX: £{capex_m1:,.0f}\nOPEX: £{opex_m1:,.0f}/wk'
+                label = f'Milling {i+1}\nμ={m1_mu}m, σ={m1_sig}m' if view_type == "ops" else f'Milling {i+1}\nOPEX: £{m1_op_pu/m1_qty:.2f} / unit\nDepr: £{m1_cap_pu/m1_qty:.2f} / unit'
                 s1.node(f'M1_{i}', label)
                 dot.edge('B1', f'M1_{i}')
                 dot.edge(f'M1_{i}', 'B2')
 
-        # Parallel Assembly Nodes
         with dot.subgraph() as s2:
             s2.attr(rank='same')
             for i in range(m2_qty):
-                label = f'Assembly {i+1}\nμ={m2_mu}m, σ={m2_sig}m' if view_type == "ops" else f'Assembly {i+1}\nCAPEX: £{capex_m2:,.0f}\nOPEX: £{opex_m2:,.0f}/wk'
+                label = f'Assembly {i+1}\nμ={m2_mu}m, σ={m2_sig}m' if view_type == "ops" else f'Assembly {i+1}\nOPEX: £{m2_op_pu/m2_qty:.2f} / unit\nDepr: £{m2_cap_pu/m2_qty:.2f} / unit'
                 s2.node(f'M2_{i}', label)
                 dot.edge('B2', f'M2_{i}')
                 dot.edge(f'M2_{i}', 'B3')
 
-        # Parallel QA Nodes
         with dot.subgraph() as s3:
             s3.attr(rank='same')
             for i in range(m3_qty):
-                label = f'QA {i+1}\nμ={m3_mu}m, σ={m3_sig}m' if view_type == "ops" else f'QA {i+1}\nCAPEX: £{capex_m3:,.0f}\nOPEX: £{opex_m3:,.0f}/wk'
+                label = f'QA {i+1}\nμ={m3_mu}m, σ={m3_sig}m' if view_type == "ops" else f'QA {i+1}\nOPEX: £{m3_op_pu/m3_qty:.2f} / unit\nDepr: £{m3_cap_pu/m3_qty:.2f} / unit'
                 s3.node(f'M3_{i}', label)
                 dot.edge('B3', f'M3_{i}')
                 dot.edge(f'M3_{i}', 'OUT')
@@ -206,14 +218,14 @@ if run_sim:
     t1, t2, t3 = st.tabs(["🗺️ Dynamic Flowcharts", "💰 Financial Dashboard", "📊 Operations & Queues"])
 
     with t1:
-        v_tab1, v_tab2 = st.tabs(["⚙️ Operations & Physics View", "💸 Financial & Asset View"])
+        v_tab1, v_tab2 = st.tabs(["⚙️ Operations & Physics View", "💸 Financial Waterfall View"])
         
         with v_tab1:
             st.markdown("**Physical Layout:** Displays parallel routing, station speeds, variance, and the resulting physical WIP buildup.")
             st.graphviz_chart(generate_vsm("ops"), use_container_width=True)
             
         with v_tab2:
-            st.markdown("**Economic Layout:** Maps the physical floor to the balance sheet. Displays machine CAPEX, OPEX, and the cash locked up in queues.")
+            st.markdown("**Economic Waterfall:** Displays Activity-Based Costing. As a unit moves left to right, it accumulates Raw Material costs, WIP queue penalties, OPEX, and Depreciation to calculate the true Landed Cost.")
             st.graphviz_chart(generate_vsm("fin"), use_container_width=True)
 
     with t2:
