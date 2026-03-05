@@ -1,5 +1,6 @@
-simpy
-plotly
 streamlit
 pandas
+simpy
+plotly
 graphviz
+xlsxwriter
