@@ -3,102 +3,153 @@ import simpy
 import random
 import pandas as pd
 import plotly.express as px
+import numpy as np
 
 st.set_page_config(page_title="DES Factory Twin", layout="wide")
 
-st.title("🏭 Discrete Event Simulation (DES): The Chaos Twin")
+st.title("🏭 Multi-Stage DES: Monte Carlo Twin")
 st.markdown("""
-Unlike MILP, which tells you the *perfect* answer in a *perfect* world, DES tells you the *likely* outcome in a *chaotic* world.
-Adjust the sliders to see how random variance creates massive bottlenecks, even when the "average" math says you have enough capacity.
+This model simulates a 3-stage value stream (Milling $\\rightarrow$ Assembly $\\rightarrow$ QA). 
+It runs **50 distinct simulations** to average out the chaos and find the true baseline, while plotting a sample timeline to visualize how variance migrates bottlenecks across the factory floor.
 """)
 
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.header("⚙️ Factory Physics")
-    st.markdown("Set the *average* times. The simulation will use exponential/normal distributions to inject randomness.")
-    
-    num_machines = st.slider("Number of Machines", 1, 5, 1)
-    arrival_rate = st.slider("Avg Part Arrival Time (mins)", 1.0, 10.0, 5.0)
-    process_rate = st.slider("Avg Processing Time (mins)", 1.0, 10.0, 4.5)
+    st.header("⚙️ System Inputs")
+    arrival_rate = st.slider("Part Arrival Rate (mins)", 1.0, 15.0, 5.0, help="Average time between new parts arriving.")
     
     st.markdown("---")
-    sim_time = st.slider("Hours to Simulate", 8, 168, 40) * 60 # Convert to minutes
-    run_sim = st.button("🎲 Run Simulation", type="primary", use_container_width=True)
-
-# --- SIMPY DES ENGINE ---
-if run_sim:
-    # We will store the data here to visualize later
-    queue_data = []
-    wait_times = []
+    st.subheader("1️⃣ Milling Station")
+    m1_qty = st.number_input("Milling Machines", 1, 10, 2)
+    m1_mu = st.slider("Milling Mean (mins)", 1.0, 20.0, 8.0)
+    m1_sig = st.slider("Milling Std Dev (mins)", 0.0, 5.0, 1.0)
     
-    def part_generator(env, machine, arrival_rate, process_rate):
-        """Generates parts randomly over time."""
-        part_id = 0
-        while True:
-            # Random wait before the next part arrives (Exponential distribution)
-            yield env.timeout(random.expovariate(1.0 / arrival_rate))
-            part_id += 1
-            
-            # Start the part processing logic in the background
-            env.process(part_task(env, f"Part_{part_id}", machine, process_rate))
+    st.markdown("---")
+    st.subheader("2️⃣ Assembly Station")
+    m2_qty = st.number_input("Assembly Machines", 1, 10, 3)
+    m2_mu = st.slider("Assembly Mean (mins)", 1.0, 20.0, 12.0)
+    m2_sig = st.slider("Assembly Std Dev (mins)", 0.0, 5.0, 2.0)
+    
+    st.markdown("---")
+    st.subheader("3️⃣ QA & Packaging")
+    m3_qty = st.number_input("QA Machines", 1, 10, 1)
+    m3_mu = st.slider("QA Mean (mins)", 1.0, 20.0, 4.0)
+    m3_sig = st.slider("QA Std Dev (mins)", 0.0, 5.0, 0.5)
 
-    def part_task(env, name, machine, process_rate):
-        """The journey of a single part."""
+    st.markdown("---")
+    sim_time = st.slider("Hours per Simulation Run", 8, 168, 40) * 60 
+    iterations = 50 # Monte Carlo runs
+    run_sim = st.button("🎲 Run 50 Simulations", type="primary", use_container_width=True)
+
+# --- DES ENGINE ---
+if run_sim:
+    
+    # Global metrics across all 50 runs
+    mc_lead_times = []
+    mc_throughput = []
+    
+    # We will save the queue data from the *last* run to plot the visual chart
+    sample_queue_data = []
+
+    def part_journey(env, stages, metrics):
+        """The routing logic for a single part."""
         arrival_time = env.now
         
-        # 1. Request a machine
-        with machine.request() as req:
-            yield req # Wait in queue until machine is free
+        # 1. Milling
+        with stages['Milling'].request() as req1:
+            yield req1
+            yield env.timeout(max(0.1, random.gauss(m1_mu, m1_sig)))
             
-            wait_time = env.now - arrival_time
-            wait_times.append(wait_time)
+        # 2. Assembly
+        with stages['Assembly'].request() as req2:
+            yield req2
+            yield env.timeout(max(0.1, random.gauss(m2_mu, m2_sig)))
             
-            # 2. Process the part (Normal distribution, 1 min standard dev)
-            actual_process_time = max(0.1, random.gauss(process_rate, 1.0))
-            yield env.timeout(actual_process_time)
+        # 3. QA
+        with stages['QA'].request() as req3:
+            yield req3
+            yield env.timeout(max(0.1, random.gauss(m3_mu, m3_sig)))
             
-    def monitor_queue(env, machine):
-        """Checks the queue length every 10 minutes to plot the chart."""
+        # Record total lead time for this part
+        metrics['lead_times'].append(env.now - arrival_time)
+
+    def part_generator(env, stages, metrics):
+        """Generates raw material over time."""
         while True:
-            queue_data.append({"Time (Mins)": env.now, "Queue Length": len(machine.queue)})
-            yield env.timeout(10) # Check every 10 simulation minutes
+            yield env.timeout(random.expovariate(1.0 / arrival_rate))
+            env.process(part_journey(env, stages, metrics))
 
-    # --- RUN THE SIMULATION ---
-    # Setup the SimPy Environment
-    env = simpy.Environment()
+    def monitor_queues(env, stages, q_data):
+        """Snapshots the Work-In-Progress (WIP) queues."""
+        while True:
+            q_data.append({
+                "Time (Mins)": env.now,
+                "Milling Queue": len(stages['Milling'].queue),
+                "Assembly Queue": len(stages['Assembly'].queue),
+                "QA Queue": len(stages['QA'].queue)
+            })
+            yield env.timeout(5) # Poll every 5 mins
+
+    # --- MONTE CARLO LOOP ---
+    progress_text = "Running Monte Carlo Simulations..."
+    my_bar = st.progress(0, text=progress_text)
     
-    # Define the Resource (The Machines)
-    factory_machine = simpy.Resource(env, capacity=num_machines)
-    
-    # Add the processes to the environment
-    env.process(part_generator(env, factory_machine, arrival_rate, process_rate))
-    env.process(monitor_queue(env, factory_machine))
-    
-    # Run the clock!
-    with st.spinner("Running 1,000s of events..."):
+    for i in range(iterations):
+        env = simpy.Environment()
+        
+        # Setup resources for this specific run
+        stages = {
+            'Milling': simpy.Resource(env, capacity=m1_qty),
+            'Assembly': simpy.Resource(env, capacity=m2_qty),
+            'QA': simpy.Resource(env, capacity=m3_qty)
+        }
+        
+        run_metrics = {'lead_times': []}
+        
+        # Only collect the chart data on the final run to keep the UI clean
+        run_q_data = []
+        
+        env.process(part_generator(env, stages, run_metrics))
+        if i == iterations - 1:
+            env.process(monitor_queues(env, stages, run_q_data))
+            
         env.run(until=sim_time)
+        
+        # Aggregate run results
+        mc_throughput.append(len(run_metrics['lead_times']))
+        if run_metrics['lead_times']:
+            mc_lead_times.extend(run_metrics['lead_times'])
+            
+        if i == iterations - 1:
+            sample_queue_data = run_q_data
+            
+        my_bar.progress((i + 1) / iterations, text=progress_text)
+        
+    my_bar.empty()
 
-    # --- RESULTS & VISUALIZATION ---
-    st.header("📊 Simulation Results")
+    # --- UI RESULTS ---
+    st.header("📊 Monte Carlo Results (Average of 50 Runs)")
     
-    # KPIs
+    avg_throughput = np.mean(mc_throughput)
+    avg_lead_time = np.mean(mc_lead_times) if mc_lead_times else 0
+    p95_lead_time = np.percentile(mc_lead_times, 95) if mc_lead_times else 0
+    
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total Parts Processed", len(wait_times))
-    c2.metric("Average Wait Time", f"{sum(wait_times)/len(wait_times):.1f} mins" if wait_times else "0 mins")
-    c3.metric("Max Queue Reached", max([d["Queue Length"] for d in queue_data]))
+    c1.metric("Avg Throughput per Shift", f"{avg_throughput:.0f} parts")
+    c2.metric("Avg Lead Time (Arrival to Exit)", f"{avg_lead_time:.1f} mins")
+    c3.metric("95th Percentile Lead Time", f"{p95_lead_time:.1f} mins", help="95% of parts finish faster than this time. High variance heavily impacts this metric.")
     
-    st.markdown("### The Physics of Queues")
-    st.info("Notice that even if Arrival Time > Processing Time (meaning you technically have enough capacity), the queue still spikes due to random variance colliding. This is why spreadsheets fail at operations planning.")
+    st.markdown("---")
+    st.subheader("Sample Timeline: Work-In-Progress (WIP) Queues")
+    st.info("This plots the queues from one specific simulation run. Notice how a bottleneck in Milling starves Assembly, but when Milling clears, Assembly suddenly gets flooded and spikes.")
     
-    # Queue Chart
-    df_q = pd.DataFrame(queue_data)
-    fig = px.line(df_q, x="Time (Mins)", y="Queue Length", title="Factory Work-In-Progress (WIP) Backlog Over Time",
-                  labels={"Queue Length": "Parts Waiting in Queue"},
-                  color_discrete_sequence=["#FF4B4B"])
-    fig.update_layout(yaxis_title="Parts in Queue", xaxis_title="Simulation Minute")
+    df_q = pd.DataFrame(sample_queue_data)
+    df_melt = df_q.melt(id_vars="Time (Mins)", var_name="Station", value_name="Parts in Queue")
     
-    # Add fill under line for visual effect
-    fig.update_traces(fill='tozeroy')
+    fig = px.area(df_melt, x="Time (Mins)", y="Parts in Queue", color="Station", 
+                  title="Factory Bottleneck Migration",
+                  color_discrete_map={"Milling Queue": "#1f77b4", "Assembly Queue": "#ff7f0e", "QA Queue": "#2ca02c"})
     st.plotly_chart(fig, use_container_width=True)
+
 else:
-    st.info("👈 Set your factory processing speeds and click 'Run Simulation'. Try setting Arrival Time to 5.0 and Process Time to 4.8 to see what happens when a system is running at 96% utilization!")
+    st.info("👈 Set your machine capacities, processing times, and variance, then run the Monte Carlo simulation.")
