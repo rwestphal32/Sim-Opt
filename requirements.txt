@@ -2,3 +2,4 @@ simpy
 plotly
 streamlit
 pandas
+graphviz
