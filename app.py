@@ -9,8 +9,8 @@ import time
 
 st.set_page_config(page_title="DAG Factory Optimizer", layout="wide")
 
-st.title("🏭 3-Step Kingman Sim-Opt Engine")
-st.markdown("This elite OR engine uses **Kingman's Formula** to mathematically size protective capacity against your Standard Deviations before running dynamic simulations to lock Kanban buffers.")
+st.title("🏭 True MRP Kingman Sim-Opt Engine")
+st.markdown("Step 1 uses algebraic **BOM Explosion (MRP)** to perfectly match demand. Step 2 uses **Kingman's Formula** for variance protection. Step 3 uses **Monte Carlo** to lock Kanban buffers.")
 
 # --- SIDEBAR: FINANCIALS & SETTINGS ---
 with st.sidebar:
@@ -30,7 +30,7 @@ with st.sidebar:
     eval_runs = 3   
     final_runs = 15 
     
-    run_opt = st.button("🚀 Run 3-Step Kingman Optimizer", type="primary", use_container_width=True)
+    run_opt = st.button("🚀 Run Algebraic Optimizer", type="primary", use_container_width=True)
 
 # --- DYNAMIC TABLES ---
 st.subheader("1️⃣ Factory Nodes (Machines, Limits & Constraints)")
@@ -44,7 +44,7 @@ default_nodes = pd.DataFrame({
     "Yield_Qty": [1, 1, 1, 1, 1, 50, 50],
     "CAPEX_Base": [0, 0, 150000, 120000, 85000, 40000, 0],
     "OPEX_Weekly": [0, 0, 2000, 2500, 3000, 1500, 0],
-    "Optimize_Qty": [True, True, True, True, True, False, False], # Sources are now checked by default!
+    "Optimize_Qty": [True, True, True, True, True, False, False], 
     "Optimize_Limit": [False, False, True, True, True, False, False]
 })
 
@@ -65,7 +65,6 @@ def evaluate_network(nodes_df, edges_df, num_runs=3, return_queues=False, includ
     sample_q_data = []
     
     empirical_processed = {row["Node_ID"]: 0 for _, row in nodes_df.iterrows()}
-
     total_capex = sum([row["Machines_Qty"] * row["CAPEX_Base"] for _, row in nodes_df[nodes_df["Type"]=="Machine"].iterrows()])
     total_opex = sum([row["Machines_Qty"] * row["OPEX_Weekly"] for _, row in nodes_df[nodes_df["Type"]=="Machine"].iterrows()])
     weekly_depr = (total_capex / 10.0) / 52.0
@@ -121,7 +120,6 @@ def evaluate_network(nodes_df, edges_df, num_runs=3, return_queues=False, includ
             if row["Type"] == "Machine":
                 machines[nid] = simpy.Resource(env, capacity=int(max(1, row["Machines_Qty"])))
 
-        # FIX: The engine now spawns multiple Sources if Qty > 1
         for _, row in nodes_df.iterrows():
             loop_count = int(max(1, row["Machines_Qty"])) if row["Type"] == "Source" else 1
             for _ in range(loop_count):
@@ -172,7 +170,6 @@ def generate_dag_vsm(nodes_df, edges_df, q_data):
             with dot.subgraph(name=f'cluster_{nid}') as s:
                 s.attr(style='invis')
                 for i in range(qty):
-                    # FIX: Data restored to the visualizer blocks
                     m_lbl = f'{nid} {i+1}\nμ={row["Mean_Mins"]}m, σ={row["StdDev_Mins"]}m'
                     s.node(f'{nid}_M{i}', m_lbl, color='#e2e3e5')
                     s.edge(f'{nid}_M{i}', f'{nid}_Buf')
@@ -190,7 +187,7 @@ def generate_dag_vsm(nodes_df, edges_df, q_data):
             dot.edge(f'{frm}_Buf', to, label=f' Pull: {req}', fontcolor='#2ca02c', color='#2ca02c')
     return dot
 
-# --- 3-STEP KINGMAN OPTIMIZER ---
+# --- 3-STEP ALGEBRAIC KINGMAN OPTIMIZER ---
 if run_opt:
     with st.spinner(f"Evaluating Client Baseline ({final_runs} Runs)..."):
         base_metrics, base_q_data = evaluate_network(edited_nodes, edited_edges, num_runs=final_runs, return_queues=True, include_variance=True)
@@ -199,39 +196,35 @@ if run_opt:
     st_log = st.empty()
     current_nodes = edited_nodes.copy()
     
-    opt_qty_idx = current_nodes[current_nodes["Optimize_Qty"] == True].index.tolist()
-    opt_lim_idx = current_nodes[current_nodes["Optimize_Limit"] == True].index.tolist()
+    # --- ALGEBRAIC MRP DEMAND TRAVERSAL ---
+    consumers = {nid: [] for nid in current_nodes["Node_ID"]}
+    for _, e in edited_edges.iterrows():
+        consumers[e["From_Node"]].append({"to": e["To_Node"], "req": e["Qty_Required"]})
 
-    # --- STEP 1: STATIC CAPACITY PLANNING (Variance = 0) ---
-    search_log = ["**STEP 1: Static Capacity Alignment (Ignoring Variance)**"]
+    def get_algebraic_demand(node):
+        if current_nodes[current_nodes["Node_ID"]==node]["Type"].values[0] == "Sink": return weekly_demand
+        total_d = 0
+        for cons in consumers[node]:
+            c_node, c_req = cons["to"], cons["req"]
+            c_yield = max(1, current_nodes[current_nodes["Node_ID"]==c_node]["Yield_Qty"].values[0])
+            total_d += (get_algebraic_demand(c_node) / c_yield) * c_req
+        return total_d
+
+    # --- STEP 1: MRP ALGEBRA (Instant sizing based on Least Common Denominators) ---
+    search_log = ["**STEP 1: Algebraic MRP BOM Explosion (Calculating precise capacities)**"]
     st_log.markdown("\n".join(search_log))
     
-    best_profit = evaluate_network(current_nodes, edited_edges, num_runs=1, include_variance=False)["profit"]
-    
-    for step in range(5): 
-        st_progress.info(f"Step 1 (Iter {step+1}): Aligning baseline capacities to demand...")
-        neighbors = []
-        for idx in opt_qty_idx:
-            # FIX: Restored the ability for the AI to dynamically scale UP if it detects it is missing demand.
-            if current_nodes.at[idx, "Machines_Qty"] < 10:
-                n_df = current_nodes.copy(); n_df.at[idx, "Machines_Qty"] += 1; neighbors.append(n_df)
-            if current_nodes.at[idx, "Machines_Qty"] > 1:
-                n_df = current_nodes.copy(); n_df.at[idx, "Machines_Qty"] -= 1; neighbors.append(n_df)
-                
-        found_better = False
-        for n_df in neighbors:
-            m = evaluate_network(n_df, edited_edges, num_runs=1, include_variance=False)
-            if m["profit"] > best_profit:
-                best_profit = m["profit"]
-                current_nodes = n_df
-                found_better = True
-                search_log.append(f"✅ Realigned Capacity. Static Profit: £{m['profit']:,.0f}")
+    for idx, row in current_nodes.iterrows():
+        if row["Optimize_Qty"]:
+            nid = row["Node_ID"]
+            target_d = get_algebraic_demand(nid)
+            if row["Mean_Mins"] > 0:
+                yield_per_mach = (sim_time / row["Mean_Mins"]) * row["Yield_Qty"]
+                req_mach = int(np.ceil(target_d / yield_per_mach))
+                current_nodes.at[idx, "Machines_Qty"] = max(1, req_mach)
+                search_log.append(f"⚙️ {nid}: Requires {target_d} units. Mathematically set to {max(1, req_mach)} Machines.")
                 st_log.markdown("\n".join(search_log))
-        time.sleep(0.01)
-        if not found_better:
-            search_log.append("🛑 Baseline capacities mathematically optimized for Takt time.")
-            st_log.markdown("\n".join(search_log))
-            break
+                time.sleep(0.05)
 
     # --- STEP 2: KINGMAN'S FORMULA ---
     search_log.append(f"\n**STEP 2: Kingman Equation (Target Max Queue: {target_max_q})**")
@@ -240,42 +233,37 @@ if run_opt:
     static_run = evaluate_network(current_nodes, edited_edges, num_runs=1, include_variance=False)
     empirical_rates = static_run["processed_rates"]
     
-    for idx in opt_qty_idx:
-        if current_nodes.at[idx, "Type"] != "Machine": continue # Kingman logic applies to processing machines
-        nid = current_nodes.at[idx, "Node_ID"]
-        lam = empirical_rates[nid] / sim_time 
-        mu = 1.0 / current_nodes.at[idx, "Mean_Mins"] if current_nodes.at[idx, "Mean_Mins"] > 0 else 1
-        std = current_nodes.at[idx, "StdDev_Mins"]
-        
-        cv_a = 1.0 
-        cv_s = std / current_nodes.at[idx, "Mean_Mins"] if current_nodes.at[idx, "Mean_Mins"] > 0 else 0
-        
-        while True:
-            c = current_nodes.at[idx, "Machines_Qty"]
-            rho = lam / (c * mu) if (c * mu) > 0 else 1
+    for idx, row in current_nodes.iterrows():
+        if row["Optimize_Qty"] and row["Type"] == "Machine":
+            nid = row["Node_ID"]
+            lam = empirical_rates[nid] / sim_time 
+            mu = 1.0 / row["Mean_Mins"] if row["Mean_Mins"] > 0 else 1
+            std = row["StdDev_Mins"]
+            cv_a = 1.0 
+            cv_s = std / row["Mean_Mins"] if row["Mean_Mins"] > 0 else 0
             
-            if rho >= 1.0:
-                current_nodes.at[idx, "Machines_Qty"] += 1
-                continue
+            while True:
+                c = current_nodes.at[idx, "Machines_Qty"]
+                rho = lam / (c * mu) if (c * mu) > 0 else 1
+                if rho >= 1.0:
+                    current_nodes.at[idx, "Machines_Qty"] += 1
+                    continue
+                lq = ((rho**(np.sqrt(2*(c+1)))) / (1 - rho)) * ((cv_a**2 + cv_s**2) / 2)
                 
-            lq = ((rho**(np.sqrt(2*(c+1)))) / (1 - rho)) * ((cv_a**2 + cv_s**2) / 2)
-            
-            if lq > target_max_q and c < 10:
-                current_nodes.at[idx, "Machines_Qty"] += 1
-                search_log.append(f"⚠️ Kingman Trigger: {nid} est. queue was {lq:.1f}. Added 1 Machine to absorb variance.")
-                st_log.markdown("\n".join(search_log))
-                time.sleep(0.05)
-            else:
-                break
-                
-    search_log.append("🛑 Protective capacities locked.")
-    st_log.markdown("\n".join(search_log))
+                if lq > target_max_q and c < 15:
+                    current_nodes.at[idx, "Machines_Qty"] += 1
+                    search_log.append(f"⚠️ Kingman Trigger: {nid} queue estimated at {lq:.1f}. Added +1 protective Machine.")
+                    st_log.markdown("\n".join(search_log))
+                    time.sleep(0.05)
+                else:
+                    break
 
     # --- STEP 3: DYNAMIC KANBAN OPTIMIZATION ---
     search_log.append("\n**STEP 3: Dynamic Kanban Monte Carlo**")
     st_log.markdown("\n".join(search_log))
     
     best_profit = evaluate_network(current_nodes, edited_edges, num_runs=eval_runs, include_variance=True)["profit"]
+    opt_lim_idx = current_nodes[current_nodes["Optimize_Limit"] == True].index.tolist()
 
     for step in range(3): 
         st_progress.info(f"Step 3 (Iter {step+1}): Optimizing Kanban limits...")
