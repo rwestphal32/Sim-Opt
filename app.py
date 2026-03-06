@@ -7,180 +7,265 @@ import numpy as np
 import graphviz
 import io
 
-st.set_page_config(page_title="DES Factory Twin", layout="wide")
+st.set_page_config(page_title="DES Dynamic Factory Twin", layout="wide")
 
-st.title("🏭 Sim-Opt Engine: The Consulting Gap Analysis")
-st.markdown("This tool evaluates a client's **Baseline Configuration** and deploys a Hill-Climbing Heuristic to find the mathematically optimal state. It provides a boardroom-ready Gap Analysis proving the financial and operational ROI of changing the network.")
+st.title("🏭 Dynamic Sim-Opt: E2E Network Twin")
+st.markdown("This engine supports a dynamic number of stages. Upload your Excel baseline or use the editable table below to add/remove processes. The Hill-Climbing AI will optimize the capacities and speed upgrades for the entire network.")
 
-# --- SIDEBAR CONTROLS (THE CLIENT'S BASELINE) ---
+# --- DATA GENERATION & I/O ---
+def generate_template():
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        pd.DataFrame({
+            "Parameter": ["Arrival_Rate_Mins", "Revenue_per_Unit", "RM_Cost_per_Unit", "WIP_Holding_Cost_per_Unit_Week"],
+            "Value": [5.0, 500.0, 150.0, 15.0]
+        }).to_excel(writer, sheet_name="System_Variables", index=False)
+        
+        pd.DataFrame({
+            "Stage_Name": ["Milling", "Assembly", "QA"],
+            "Qty_Machines": [2, 2, 1],
+            "Mean_Mins": [8.0, 12.0, 4.0],
+            "StdDev_Mins": [1.0, 2.0, 0.5],
+            "CAPEX_Base": [150000, 85000, 40000],
+            "OPEX_Weekly": [2000, 3000, 1500]
+        }).to_excel(writer, sheet_name="Routing_Stages", index=False)
+    return output.getvalue()
+
 with st.sidebar:
-    st.header("⚙️ Client Baseline Physics")
-    arrival_rate = st.slider("Part Arrival Rate (mins)", 1.0, 15.0, 5.0)
+    st.header("📥 Data Management")
+    st.download_button("📥 Download Excel Template", data=generate_template(), file_name="Factory_Baseline.xlsx")
+    uploaded_file = st.file_uploader("Upload Baseline (.xlsx)", type=["xlsx"])
     
     st.markdown("---")
-    m1_qty = st.number_input("Milling Machines", 1, 10, 2)
-    m1_mu = st.slider("Milling Mean (mins)", 1.0, 20.0, 8.0)
-    m1_sig = st.slider("Milling Std Dev (mins)", 0.0, 5.0, 1.0)
-    
-    st.markdown("---")
-    m2_qty = st.number_input("Assembly Machines", 1, 10, 2)
-    m2_mu = st.slider("Assembly Mean (mins)", 1.0, 20.0, 12.0)
-    m2_sig = st.slider("Assembly Std Dev (mins)", 0.0, 5.0, 2.0)
-    
-    st.markdown("---")
-    m3_qty = st.number_input("QA Machines", 1, 10, 1)
-    m3_mu = st.slider("QA Mean (mins)", 1.0, 20.0, 4.0)
-    m3_sig = st.slider("QA Std Dev (mins)", 0.0, 5.0, 0.5)
-
-    st.header("💸 Financial Economics")
-    unit_revenue = st.number_input("Revenue per Unit (£)", value=500)
-    rm_cost = st.number_input("Raw Material Cost (£)", value=150)
-    wip_cost_per_unit = st.number_input("WIP Penalty/Unit/Week (£)", value=15)
-    
-    base_capex = [150000, 85000, 40000]
-    base_opex = [2000, 3000, 1500]
-    
+    st.header("⚙️ System Variables")
+    if uploaded_file:
+        sys_df = pd.read_excel(uploaded_file, sheet_name="System_Variables").set_index("Parameter")
+        arr_rate = st.number_input("RM Arrival Rate (mins)", value=float(sys_df.loc["Arrival_Rate_Mins", "Value"]))
+        rev_unit = st.number_input("Revenue/Unit (£)", value=float(sys_df.loc["Revenue_per_Unit", "Value"]))
+        rm_cost = st.number_input("RM Cost/Unit (£)", value=float(sys_df.loc["RM_Cost_per_Unit", "Value"]))
+        wip_cost = st.number_input("WIP Holding Penalty (£/wk)", value=float(sys_df.loc["WIP_Holding_Cost_per_Unit_Week", "Value"]))
+    else:
+        arr_rate = st.number_input("RM Arrival Rate (mins)", value=5.0)
+        rev_unit = st.number_input("Revenue/Unit (£)", value=500.0)
+        rm_cost = st.number_input("RM Cost/Unit (£)", value=150.0)
+        wip_cost = st.number_input("WIP Holding Penalty (£/wk)", value=15.0)
+        
     sim_time = 40 * 60 # 40 hours
-    
-    st.markdown("---")
-    run_analysis = st.button("🚀 Run Gap Analysis", type="primary", use_container_width=True)
+    run_analysis = st.button("🚀 Run AI Gap Analysis", type="primary", use_container_width=True)
 
-# --- CORE DES EVALUATION FUNCTION ---
-def evaluate_layout(state, num_runs=50, return_queues=False):
-    q1, q2, q3, s1, s2, s3 = state
-    mu_mods = [1.0 if s==0 else 0.7 for s in [s1, s2, s3]]
-    cap_mods = [1.0 if s==0 else 2.0 for s in [s1, s2, s3]]
-    op_mods = [1.0 if s==0 else 1.5 for s in [s1, s2, s3]]
+# --- DYNAMIC STAGE EDITOR ---
+st.subheader("🛠️ Process Routing (Editable)")
+if uploaded_file:
+    default_stages = pd.read_excel(uploaded_file, sheet_name="Routing_Stages")
+else:
+    default_stages = pd.DataFrame({
+        "Stage_Name": ["Milling", "Assembly", "QA"],
+        "Qty_Machines": [2, 2, 1],
+        "Mean_Mins": [8.0, 12.0, 4.0],
+        "StdDev_Mins": [1.0, 2.0, 0.5],
+        "CAPEX_Base": [150000, 85000, 40000],
+        "OPEX_Weekly": [2000, 3000, 1500]
+    })
+
+# The user can add/delete rows right here in the UI
+edited_stages = st.data_editor(default_stages, num_rows="dynamic", use_container_width=True)
+stage_names = edited_stages["Stage_Name"].tolist()
+num_stages = len(stage_names)
+
+# --- CORE DES EVALUATION FUNCTION (DYNAMIC) ---
+def evaluate_network(qtys, speeds, num_runs=50, return_queues=False):
+    """
+    qtys: list of machine counts per stage
+    speeds: list of 0 (standard) or 1 (high-speed) per stage
+    """
+    mu_mods = [1.0 if s==0 else 0.7 for s in speeds]
+    cap_mods = [1.0 if s==0 else 2.0 for s in speeds]
+    op_mods = [1.0 if s==0 else 1.5 for s in speeds]
     
     mc_tp = []
     mc_lt = []
     wip_counts = []
     sample_q_data = []
 
-    def part_journey(env, stages):
+    def part_journey(env, resources):
         arr = env.now
-        with stages['M1'].request() as req1:
-            yield req1
-            yield env.timeout(max(0.1, random.gauss(m1_mu * mu_mods[0], m1_sig)))
-        with stages['M2'].request() as req2:
-            yield req2
-            yield env.timeout(max(0.1, random.gauss(m2_mu * mu_mods[1], m2_sig)))
-        with stages['M3'].request() as req3:
-            yield req3
-            yield env.timeout(max(0.1, random.gauss(m3_mu * mu_mods[2], m3_sig)))
+        for i in range(num_stages):
+            with resources[i].request() as req:
+                yield req
+                mean_time = edited_stages.loc[i, "Mean_Mins"] * mu_mods[i]
+                std_time = edited_stages.loc[i, "StdDev_Mins"]
+                yield env.timeout(max(0.1, random.gauss(mean_time, std_time)))
         mc_tp_run.append(1)
         mc_lt_run.append(env.now - arr)
 
-    def part_generator(env, stages):
+    def part_generator(env, resources):
         while True:
-            yield env.timeout(random.expovariate(1.0 / arrival_rate))
-            env.process(part_journey(env, stages))
+            yield env.timeout(random.expovariate(1.0 / arr_rate))
+            env.process(part_journey(env, resources))
 
-    def monitor_queues(env, stages, q_data, save_sample):
+    def monitor_queues(env, resources, q_data, save_sample):
         while True:
-            total_wip = len(stages['M1'].queue) + len(stages['M2'].queue) + len(stages['M3'].queue)
+            total_wip = sum([len(r.queue) for r in resources])
             run_wip.append(total_wip)
             if save_sample:
-                q_data.append({
-                    "Time": env.now, "Milling Queue": len(stages['M1'].queue),
-                    "Assembly Queue": len(stages['M2'].queue), "QA Queue": len(stages['M3'].queue)
-                })
+                row = {"Time": env.now}
+                for i in range(num_stages):
+                    row[f"{stage_names[i]} Queue"] = len(resources[i].queue)
+                q_data.append(row)
             yield env.timeout(5)
 
-    for i in range(num_runs):
+    for r_idx in range(num_runs):
         env = simpy.Environment()
-        stages = {'M1': simpy.Resource(env, capacity=q1), 'M2': simpy.Resource(env, capacity=q2), 'M3': simpy.Resource(env, capacity=q3)}
+        resources = [simpy.Resource(env, capacity=qtys[i]) for i in range(num_stages)]
         mc_tp_run, mc_lt_run, run_wip = [], [], []
         
-        save_sample = return_queues and (i == num_runs - 1)
+        save_sample = return_queues and (r_idx == num_runs - 1)
         
-        env.process(part_generator(env, stages))
-        env.process(monitor_queues(env, stages, sample_q_data, save_sample))
+        env.process(part_generator(env, resources))
+        env.process(monitor_queues(env, resources, sample_q_data, save_sample))
         env.run(until=sim_time)
         
         mc_tp.append(len(mc_tp_run))
         if mc_lt_run: mc_lt.extend(mc_lt_run)
-        wip_counts.append(np.mean(run_wip))
+        wip_counts.append(np.mean(run_wip) if run_wip else 0)
 
     avg_tp = np.mean(mc_tp)
     avg_wip = np.mean(wip_counts)
     avg_lt = np.mean(mc_lt) if mc_lt else 0
     
-    total_capex = (q1*base_capex[0]*cap_mods[0]) + (q2*base_capex[1]*cap_mods[1]) + (q3*base_capex[2]*cap_mods[2])
-    total_opex = (q1*base_opex[0]*op_mods[0]) + (q2*base_opex[1]*op_mods[1]) + (q3*base_opex[2]*op_mods[2])
+    # Financials
+    total_capex = sum([qtys[i] * edited_stages.loc[i, "CAPEX_Base"] * cap_mods[i] for i in range(num_stages)])
+    total_opex = sum([qtys[i] * edited_stages.loc[i, "OPEX_Weekly"] * op_mods[i] for i in range(num_stages)])
     
-    weekly_rev = avg_tp * unit_revenue
-    weekly_rm = avg_tp * rm_cost
-    weekly_wip_cost = avg_wip * wip_cost_per_unit
+    weekly_rev = avg_tp * rev_unit
+    weekly_rm_tot = avg_tp * rm_cost
+    weekly_wip_tot = avg_wip * wip_cost
     weekly_depr = total_capex / 520.0 
     
-    net_profit = weekly_rev - weekly_rm - total_opex - weekly_wip_cost - weekly_depr
+    net_profit = weekly_rev - weekly_rm_tot - total_opex - weekly_wip_tot - weekly_depr
     
-    res = {"profit": net_profit, "tp": avg_tp, "wip": avg_wip, "lt": avg_lt, "capex": total_capex, "opex": total_opex}
+    # Calculate buffer queue averages for the specific sample run for VSM plotting
+    q_avgs = []
+    if return_queues and sample_q_data:
+        df_q = pd.DataFrame(sample_q_data)
+        for i in range(num_stages):
+            q_avgs.append(df_q[f"{stage_names[i]} Queue"].mean())
+    else:
+        q_avgs = [0] * num_stages
+    
+    res = {"profit": net_profit, "tp": avg_tp, "wip": avg_wip, "lt": avg_lt, "capex": total_capex, "opex": total_opex, "q_avgs": q_avgs}
     if return_queues: return res, sample_q_data
     return res
 
-# --- GRAPHVIZ VSM GENERATOR ---
-def generate_vsm(state, metrics, title="Value Stream Map"):
-    q1, q2, q3, s1, s2, s3 = state
-    mu_mods = [1.0 if s==0 else 0.7 for s in [s1, s2, s3]]
-    cap_mods = [1.0 if s==0 else 2.0 for s in [s1, s2, s3]]
+# --- GRAPHVIZ VSM GENERATOR (DYNAMIC & PARALLEL) ---
+def generate_vsm(qtys, speeds, metrics, view_type="ops"):
+    mu_mods = [1.0 if s==0 else 0.7 for s in speeds]
+    cap_mods = [1.0 if s==0 else 2.0 for s in speeds]
+    op_mods = [1.0 if s==0 else 1.5 for s in speeds]
+    q_avgs = metrics["q_avgs"]
+    tp = max(1, metrics["tp"])
     
     dot = graphviz.Digraph(node_attr={'shape': 'box', 'style': 'filled', 'color': '#E1E4E8', 'fontname': 'Helvetica'})
-    dot.attr(rankdir='LR', splines='ortho', label=title, labelloc='t', fontsize='16')
+    dot.attr(rankdir='LR', splines='ortho')
     
-    dot.node('IN', f'Raw Materials\nArrival: {arrival_rate}m', color='#cce5ff', shape='folder')
-    dot.node('OUT', f'Finished Goods\nThroughput: {metrics["tp"]:.0f}/wk\nProfit: £{metrics["profit"]:,.0f}/wk', color='#d4edda', shape='folder')
-    
-    dot.node('B', f'Total WIP Holding\nAvg {metrics["wip"]:.1f} parts\nCost: £{metrics["wip"]*wip_cost_per_unit:,.0f}/wk', color='#f8d7da', shape='cylinder')
-    dot.edge('IN', 'B')
-    
-    with dot.subgraph() as sys:
-        sys.attr(rank='same')
-        sys.node('M1', f'Milling x{q1}\n{"⚡ High-Speed" if s1 else "Standard"}\nμ={m1_mu*mu_mods[0]:.1f}m\nCAPEX: £{q1*base_capex[0]*cap_mods[0]/1000:.0f}k', color='#e2e3e5' if s1==0 else '#ffeeba')
-        sys.node('M2', f'Assembly x{q2}\n{"⚡ High-Speed" if s2 else "Standard"}\nμ={m2_mu*mu_mods[1]:.1f}m\nCAPEX: £{q2*base_capex[1]*cap_mods[1]/1000:.0f}k', color='#e2e3e5' if s2==0 else '#ffeeba')
-        sys.node('M3', f'QA x{q3}\n{"⚡ High-Speed" if s3 else "Standard"}\nμ={m3_mu*mu_mods[2]:.1f}m\nCAPEX: £{q3*base_capex[2]*cap_mods[2]/1000:.0f}k', color='#e2e3e5' if s3==0 else '#ffeeba')
+    # Starting Node
+    if view_type == "ops":
+        dot.node('IN', f'Raw Materials\nArrival: {arr_rate}m', color='#cce5ff', shape='folder')
+    else:
+        dot.node('IN', f'Raw Materials\n£{rm_cost:.2f} / unit', color='#cce5ff', shape='folder')
         
-        dot.edge('B', 'M1'); dot.edge('M1', 'M2'); dot.edge('M2', 'M3'); dot.edge('M3', 'OUT')
+    prev_node = 'IN'
+    total_cost_pu = rm_cost
+    
+    for i in range(num_stages):
+        buffer_id = f'B{i}'
+        b_pu = (q_avgs[i] * wip_cost) / tp
+        total_cost_pu += b_pu
         
+        # Buffer Node
+        if view_type == "ops":
+            dot.node(buffer_id, f'WIP Buffer {i+1}\nAvg: {q_avgs[i]:.1f} parts', color='#fff3cd', shape='cylinder')
+        else:
+            dot.node(buffer_id, f'WIP Buffer {i+1}\nPenalty: £{b_pu:.2f} / unit', color='#f8d7da', shape='cylinder')
+            
+        dot.edge(prev_node, buffer_id)
+        
+        # Parallel Processing Nodes
+        with dot.subgraph() as s:
+            s.attr(rank='same')
+            m_op_pu = (qtys[i] * edited_stages.loc[i, "OPEX_Weekly"] * op_mods[i]) / tp if qtys[i] > 0 else 0
+            m_cap_pu = ((qtys[i] * edited_stages.loc[i, "CAPEX_Base"] * cap_mods[i]) / 520) / tp if qtys[i] > 0 else 0
+            total_cost_pu += (m_op_pu + m_cap_pu)
+            
+            for m in range(qtys[i]):
+                node_id = f'S{i}_M{m}'
+                if view_type == "ops":
+                    mean_val = edited_stages.loc[i, "Mean_Mins"] * mu_mods[i]
+                    lbl = f'{stage_names[i]} {m+1}\n{"⚡ High-Speed" if speeds[i] else "Standard"}\nμ={mean_val:.1f}m, σ={edited_stages.loc[i, "StdDev_Mins"]}m'
+                else:
+                    lbl = f'{stage_names[i]} {m+1}\nOPEX: £{m_op_pu/qtys[i] if qtys[i]>0 else 0:.2f} / unit\nDepr: £{m_cap_pu/qtys[i] if qtys[i]>0 else 0:.2f} / unit'
+                s.node(node_id, lbl, color='#e2e3e5' if speeds[i]==0 else '#ffeeba')
+                dot.edge(buffer_id, node_id)
+                
+        # To merge parallel nodes back, we use an invisible node or direct to next buffer.
+        # Directing to next buffer happens in the next loop, but we need a merge point.
+        merge_id = f'Merge{i}'
+        dot.node(merge_id, '', shape='point', width='0')
+        for m in range(qtys[i]):
+            dot.edge(f'S{i}_M{m}', merge_id)
+            
+        prev_node = merge_id
+
+    # Ending Node
+    net_margin_pu = rev_unit - total_cost_pu
+    if view_type == "ops":
+        dot.node('OUT', f'Finished Goods\nThroughput: {metrics["tp"]:.0f}/wk\nLead Time: {metrics["lt"]:.1f}m', color='#d4edda', shape='folder')
+    else:
+        dot.node('OUT', f'Finished Goods\nCost: £{total_cost_pu:.2f} / unit\nMargin: £{net_margin_pu:.2f} / unit', color='#d4edda', shape='folder')
+        
+    dot.edge(prev_node, 'OUT')
     return dot
 
 # --- EXECUTION & HILL CLIMBER ---
 if run_analysis:
-    baseline_state = (m1_qty, m2_qty, m3_qty, 0, 0, 0)
+    base_qtys = edited_stages["Qty_Machines"].tolist()
+    base_speeds = [0] * num_stages # Baseline is all 0 (Standard speed)
     
     with st.spinner("Evaluating Client Baseline (50 Runs)..."):
-        base_metrics, base_q_data = evaluate_layout(baseline_state, num_runs=50, return_queues=True)
+        base_metrics, base_q_data = evaluate_network(base_qtys, base_speeds, num_runs=50, return_queues=True)
         
     st_progress = st.empty()
     st_log = st.empty()
     
-    current_state = baseline_state
+    curr_qtys = list(base_qtys)
+    curr_speeds = list(base_speeds)
     best_profit = base_metrics["profit"]
-    search_log = ["🔍 **Commencing Heuristic Search...**"]
+    search_log = ["🔍 **Commencing Dynamic Heuristic Search...**"]
     
-    # The Hill Climber
     for step in range(5):
         st_progress.info(f"Optimization Step {step+1}: Evaluating neighbors...")
         neighbors = []
-        for i in range(3):
+        
+        # Generate Qty +/- 1
+        for i in range(num_stages):
             for delta in [-1, 1]:
-                n = list(current_state)
-                n[i] += delta
-                if 1 <= n[i] <= 5: neighbors.append(tuple(n))
-        for i in range(3, 6):
-            n = list(current_state)
-            n[i] = 1 if current_state[i] == 0 else 0
-            neighbors.append(tuple(n))
+                nq = list(curr_qtys)
+                nq[i] += delta
+                if 1 <= nq[i] <= 10: neighbors.append((nq, curr_speeds))
+        # Generate Speed toggles
+        for i in range(num_stages):
+            ns = list(curr_speeds)
+            ns[i] = 1 if curr_speeds[i] == 0 else 0
+            neighbors.append((curr_qtys, ns))
             
         found_better = False
-        for n in neighbors:
-            m = evaluate_layout(n, num_runs=10) # Fast eval
+        for nq, ns in neighbors:
+            m = evaluate_network(nq, ns, num_runs=10) # Fast eval
             if m["profit"] > best_profit:
                 best_profit = m["profit"]
-                current_state = n
+                curr_qtys, curr_speeds = nq, ns
                 found_better = True
-                search_log.append(f"✅ Found better state: {n} | Est. Profit: £{m['profit']:,.0f}")
+                search_log.append(f"✅ Found better state. Est. Profit: £{m['profit']:,.0f}")
                 st_log.markdown("\n".join(search_log))
                 
         if not found_better:
@@ -192,15 +277,13 @@ if run_analysis:
     st_log.empty()
     
     with st.spinner("Verifying Optimal Configuration (50 Runs)..."):
-        opt_metrics, opt_q_data = evaluate_layout(current_state, num_runs=50, return_queues=True)
+        opt_metrics, opt_q_data = evaluate_network(curr_qtys, curr_speeds, num_runs=50, return_queues=True)
 
     # --- UI DASHBOARDS ---
     t1, t2, t3, t4 = st.tabs(["🏆 Executive Gap Analysis", "🗺️ Value Stream Maps", "📈 Queue Physics", "📥 CFO Audit Ledger"])
 
     with t1:
         st.subheader("Consulting Scorecard: Baseline vs. Optimized")
-        
-        # Calculate Deltas
         d_prof = opt_metrics["profit"] - base_metrics["profit"]
         d_tp = opt_metrics["tp"] - base_metrics["tp"]
         d_lt = opt_metrics["lt"] - base_metrics["lt"]
@@ -218,50 +301,49 @@ if run_analysis:
             st.success(f"**Investment Thesis:** The optimizer suggests deploying an additional **£{d_cap:,.0f}** in CAPEX. This unlocks **£{d_prof*52:,.0f}** in annualized marginal profit, representing a payback period of **{marginal_payback:.1f} months** on the new capital.")
         elif d_cap < 0 and d_prof > 0:
             st.success(f"**Lean Thesis:** The optimizer found a more efficient state that requires **£{-d_cap:,.0f} LESS** CAPEX while increasing weekly profit. Assets should be divested or repurposed.")
-        elif d_prof <= 0:
-            st.info("The current baseline is already optimal for the given parameters. No changes recommended.")
 
     with t2:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.graphviz_chart(generate_vsm(baseline_state, base_metrics, "Current Baseline Configuration"), use_container_width=True)
-        with col2:
-            st.graphviz_chart(generate_vsm(current_state, opt_metrics, "Optimized Configuration"), use_container_width=True)
+        st.markdown("Toggle between Physics (Flow) and Financial (Activity-Based Costing) views. The parallel routing visually demonstrates capacity width.")
+        v_base, v_opt = st.tabs(["📊 Baseline State Diagrams", "🚀 Optimized State Diagrams"])
+        
+        with v_base:
+            st.markdown("### Operations & Physics Flow")
+            st.graphviz_chart(generate_vsm(base_qtys, base_speeds, base_metrics, "ops"), use_container_width=True)
+            st.markdown("### Financial Unit Cost Waterfall")
+            st.graphviz_chart(generate_vsm(base_qtys, base_speeds, base_metrics, "fin"), use_container_width=True)
+            
+        with v_opt:
+            st.markdown("### Operations & Physics Flow")
+            st.graphviz_chart(generate_vsm(curr_qtys, curr_speeds, opt_metrics, "ops"), use_container_width=True)
+            st.markdown("### Financial Unit Cost Waterfall")
+            st.graphviz_chart(generate_vsm(curr_qtys, curr_speeds, opt_metrics, "fin"), use_container_width=True)
 
     with t3:
         st.subheader("Physics Verification: WIP Queues Over Time")
-        st.markdown("Overlay of the physical bottleneck buildup (Sample Run). Notice how the optimized state stabilizes the chaotic queue spikes seen in the baseline.")
-        
-        df_base = pd.DataFrame(base_q_data).melt(id_vars="Time", var_name="Station", value_name="Parts in Queue")
+        df_base = pd.DataFrame(base_q_data).melt(id_vars="Time", var_name="Queue", value_name="Parts")
         df_base["State"] = "Baseline"
-        df_opt = pd.DataFrame(opt_q_data).melt(id_vars="Time", var_name="Station", value_name="Parts in Queue")
+        df_opt = pd.DataFrame(opt_q_data).melt(id_vars="Time", var_name="Queue", value_name="Parts")
         df_opt["State"] = "Optimized"
         
-        df_combined = pd.concat([df_base, df_opt])
-        fig = px.line(df_combined, x="Time", y="Parts in Queue", color="Station", line_dash="State",
-                      title="Bottleneck Migration: Baseline vs Optimized",
-                      color_discrete_map={"Milling Queue": "#1f77b4", "Assembly Queue": "#ff7f0e", "QA Queue": "#2ca02c"})
+        fig = px.line(pd.concat([df_base, df_opt]), x="Time", y="Parts", color="Queue", line_dash="State", title="Bottleneck Migration Comparison")
         st.plotly_chart(fig, use_container_width=True)
 
     with t4:
         st.subheader("Export Analysis Data")
-        # Build comparison ledger
-        comp_data = [
-            {"Metric": "Milling Configuration", "Baseline": f"{baseline_state[0]}x Standard", "Optimized": f"{current_state[0]}x {'High-Speed' if current_state[3] else 'Standard'}"},
-            {"Metric": "Assembly Configuration", "Baseline": f"{baseline_state[1]}x Standard", "Optimized": f"{current_state[1]}x {'High-Speed' if current_state[4] else 'Standard'}"},
-            {"Metric": "QA Configuration", "Baseline": f"{baseline_state[2]}x Standard", "Optimized": f"{current_state[2]}x {'High-Speed' if current_state[5] else 'Standard'}"},
-            {"Metric": "Weekly Profit", "Baseline": base_metrics["profit"], "Optimized": opt_metrics["profit"]},
-            {"Metric": "CAPEX", "Baseline": base_metrics["capex"], "Optimized": opt_metrics["capex"]},
-            {"Metric": "Avg Lead Time (Mins)", "Baseline": base_metrics["lt"], "Optimized": opt_metrics["lt"]},
-        ]
+        comp_data = []
+        for i in range(num_stages):
+            comp_data.append({
+                "Stage": stage_names[i],
+                "Baseline Config": f"{base_qtys[i]}x Standard",
+                "Optimized Config": f"{curr_qtys[i]}x {'High-Speed' if curr_speeds[i] else 'Standard'}"
+            })
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            pd.DataFrame(comp_data).to_excel(writer, sheet_name="Gap_Analysis", index=False)
+            pd.DataFrame(comp_data).to_excel(writer, sheet_name="Stage_Deltas", index=False)
+            pd.DataFrame([base_metrics]).to_excel(writer, sheet_name="Base_Financials", index=False)
+            pd.DataFrame([opt_metrics]).to_excel(writer, sheet_name="Opt_Financials", index=False)
             pd.DataFrame(base_q_data).to_excel(writer, sheet_name="Baseline_Queue_Raw", index=False)
             pd.DataFrame(opt_q_data).to_excel(writer, sheet_name="Optimal_Queue_Raw", index=False)
             
-        st.download_button("📥 Export Boardroom Audit (.xlsx)", data=output.getvalue(), file_name="Digital_Twin_Gap_Analysis.xlsx")
-
-else:
-    st.info("👈 Set the client's current baseline parameters and hit 'Run Gap Analysis'.")
+        st.download_button("📥 Export Boardroom Audit (.xlsx)", data=output.getvalue(), file_name="Dynamic_Twin_Gap_Analysis.xlsx")
