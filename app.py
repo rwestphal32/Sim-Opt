@@ -15,8 +15,8 @@ st.markdown("This elite OR engine uses **Kingman's Formula** to mathematically s
 # --- SIDEBAR: FINANCIALS & SETTINGS ---
 with st.sidebar:
     st.header("🎯 Demand & Kingman Target")
-    weekly_demand = st.number_input("Actual Weekly Demand", value=250)
-    target_max_q = st.slider("Target Max Queue (Kingman)", 2, 50, 10, help="The AI will algebraically add protective capacity to ensure natural variance never creates a queue larger than this.")
+    weekly_demand = st.number_input("Actual Weekly Demand", value=500)
+    target_max_q = st.slider("Target Max Queue (Kingman)", 2, 50, 10)
     
     st.markdown("---")
     st.header("💸 Financial Economics")
@@ -44,7 +44,7 @@ default_nodes = pd.DataFrame({
     "Yield_Qty": [1, 1, 1, 1, 1, 50, 50],
     "CAPEX_Base": [0, 0, 150000, 120000, 85000, 40000, 0],
     "OPEX_Weekly": [0, 0, 2000, 2500, 3000, 1500, 0],
-    "Optimize_Qty": [False, False, True, True, True, False, False], 
+    "Optimize_Qty": [True, True, True, True, True, False, False], # Sources are now checked by default!
     "Optimize_Limit": [False, False, True, True, True, False, False]
 })
 
@@ -64,7 +64,6 @@ def evaluate_network(nodes_df, edges_df, num_runs=3, return_queues=False, includ
     run_profits, run_tps, run_wips = [], [], []
     sample_q_data = []
     
-    # We track total units processed to calculate empirical Arrival Rates (Lambda) for Kingman
     empirical_processed = {row["Node_ID"]: 0 for _, row in nodes_df.iterrows()}
 
     total_capex = sum([row["Machines_Qty"] * row["CAPEX_Base"] for _, row in nodes_df[nodes_df["Type"]=="Machine"].iterrows()])
@@ -122,8 +121,11 @@ def evaluate_network(nodes_df, edges_df, num_runs=3, return_queues=False, includ
             if row["Type"] == "Machine":
                 machines[nid] = simpy.Resource(env, capacity=int(max(1, row["Machines_Qty"])))
 
+        # FIX: The engine now spawns multiple Sources if Qty > 1
         for _, row in nodes_df.iterrows():
-            env.process(universal_node_process(env, row["Node_ID"], row["Type"], row["Mean_Mins"], row["StdDev_Mins"], row["Yield_Qty"], buffers, machines))
+            loop_count = int(max(1, row["Machines_Qty"])) if row["Type"] == "Source" else 1
+            for _ in range(loop_count):
+                env.process(universal_node_process(env, row["Node_ID"], row["Type"], row["Mean_Mins"], row["StdDev_Mins"], row["Yield_Qty"], buffers, machines))
             
         env.process(monitor_network(env, buffers, sample_q_data, save_sample))
         env.run(until=sim_time)
@@ -141,9 +143,7 @@ def evaluate_network(nodes_df, edges_df, num_runs=3, return_queues=False, includ
         run_tps.append(tp_val)
         run_wips.append(wip_val)
 
-    # Average the empirical processed counts across runs to calculate Lambda
     avg_processed = {k: v/num_runs for k, v in empirical_processed.items()}
-
     res = {"profit": np.mean(run_profits), "tp": np.mean(run_tps), "wip": np.mean(run_wips), "capex": total_capex, "processed_rates": avg_processed}
     if return_queues: return res, sample_q_data
     return res
@@ -160,7 +160,8 @@ def generate_dag_vsm(nodes_df, edges_df, q_data):
         final_wip = df_q[f"{nid}_WIP"].iloc[-1] if df_q is not None else 0
         
         if ntype == "Source":
-            dot.node(f'{nid}_Src', f'{nid}\n(Source)\nμ={row["Mean_Mins"]}m', color='#cce5ff', shape='folder')
+            lbl = f'{nid}\n(Source)\n[{qty}x Streams]\nμ={row["Mean_Mins"]}m'
+            dot.node(f'{nid}_Src', lbl, color='#cce5ff', shape='folder')
             dot.node(f'{nid}_Buf', f'{nid} Buffer\nQty: {final_wip} / {lim}', color='#fff3cd', shape='cylinder')
             dot.edge(f'{nid}_Src', f'{nid}_Buf')
         elif ntype == "Sink":
@@ -171,7 +172,9 @@ def generate_dag_vsm(nodes_df, edges_df, q_data):
             with dot.subgraph(name=f'cluster_{nid}') as s:
                 s.attr(style='invis')
                 for i in range(qty):
-                    s.node(f'{nid}_M{i}', f'{nid} {i+1}', color='#e2e3e5')
+                    # FIX: Data restored to the visualizer blocks
+                    m_lbl = f'{nid} {i+1}\nμ={row["Mean_Mins"]}m, σ={row["StdDev_Mins"]}m'
+                    s.node(f'{nid}_M{i}', m_lbl, color='#e2e3e5')
                     s.edge(f'{nid}_M{i}', f'{nid}_Buf')
 
     for _, edge in edges_df.iterrows():
@@ -196,7 +199,7 @@ if run_opt:
     st_log = st.empty()
     current_nodes = edited_nodes.copy()
     
-    opt_qty_idx = current_nodes[(current_nodes["Type"] == "Machine") & (current_nodes["Optimize_Qty"] == True)].index.tolist()
+    opt_qty_idx = current_nodes[current_nodes["Optimize_Qty"] == True].index.tolist()
     opt_lim_idx = current_nodes[current_nodes["Optimize_Limit"] == True].index.tolist()
 
     # --- STEP 1: STATIC CAPACITY PLANNING (Variance = 0) ---
@@ -205,12 +208,16 @@ if run_opt:
     
     best_profit = evaluate_network(current_nodes, edited_edges, num_runs=1, include_variance=False)["profit"]
     
-    for step in range(3): 
-        st_progress.info(f"Step 1 (Iter {step+1}): Stripping excess capacity...")
+    for step in range(5): 
+        st_progress.info(f"Step 1 (Iter {step+1}): Aligning baseline capacities to demand...")
         neighbors = []
         for idx in opt_qty_idx:
+            # FIX: Restored the ability for the AI to dynamically scale UP if it detects it is missing demand.
+            if current_nodes.at[idx, "Machines_Qty"] < 10:
+                n_df = current_nodes.copy(); n_df.at[idx, "Machines_Qty"] += 1; neighbors.append(n_df)
             if current_nodes.at[idx, "Machines_Qty"] > 1:
                 n_df = current_nodes.copy(); n_df.at[idx, "Machines_Qty"] -= 1; neighbors.append(n_df)
+                
         found_better = False
         for n_df in neighbors:
             m = evaluate_network(n_df, edited_edges, num_runs=1, include_variance=False)
@@ -218,29 +225,29 @@ if run_opt:
                 best_profit = m["profit"]
                 current_nodes = n_df
                 found_better = True
-                search_log.append(f"✅ Scaled down excess capacity. Static Profit: £{m['profit']:,.0f}")
+                search_log.append(f"✅ Realigned Capacity. Static Profit: £{m['profit']:,.0f}")
                 st_log.markdown("\n".join(search_log))
         time.sleep(0.01)
         if not found_better:
-            search_log.append("🛑 Baseline capacities mathematically minimized.")
+            search_log.append("🛑 Baseline capacities mathematically optimized for Takt time.")
             st_log.markdown("\n".join(search_log))
             break
 
-    # --- STEP 2: KINGMAN'S FORMULA (Algebraic Protective Capacity) ---
+    # --- STEP 2: KINGMAN'S FORMULA ---
     search_log.append(f"\n**STEP 2: Kingman Equation (Target Max Queue: {target_max_q})**")
     st_log.markdown("\n".join(search_log))
     
-    # Run a fast static eval to get empirical Arrival Rates (Lambda) for Kingman
     static_run = evaluate_network(current_nodes, edited_edges, num_runs=1, include_variance=False)
     empirical_rates = static_run["processed_rates"]
     
     for idx in opt_qty_idx:
+        if current_nodes.at[idx, "Type"] != "Machine": continue # Kingman logic applies to processing machines
         nid = current_nodes.at[idx, "Node_ID"]
-        lam = empirical_rates[nid] / sim_time # Parts arriving per minute
+        lam = empirical_rates[nid] / sim_time 
         mu = 1.0 / current_nodes.at[idx, "Mean_Mins"] if current_nodes.at[idx, "Mean_Mins"] > 0 else 1
         std = current_nodes.at[idx, "StdDev_Mins"]
         
-        cv_a = 1.0 # Approximating Poisson arrival from upstream networks
+        cv_a = 1.0 
         cv_s = std / current_nodes.at[idx, "Mean_Mins"] if current_nodes.at[idx, "Mean_Mins"] > 0 else 0
         
         while True:
@@ -251,7 +258,6 @@ if run_opt:
                 current_nodes.at[idx, "Machines_Qty"] += 1
                 continue
                 
-            # Kingman's Approximation for M/G/c queues
             lq = ((rho**(np.sqrt(2*(c+1)))) / (1 - rho)) * ((cv_a**2 + cv_s**2) / 2)
             
             if lq > target_max_q and c < 10:
@@ -265,7 +271,7 @@ if run_opt:
     search_log.append("🛑 Protective capacities locked.")
     st_log.markdown("\n".join(search_log))
 
-    # --- STEP 3: DYNAMIC KANBAN OPTIMIZATION (Monte Carlo) ---
+    # --- STEP 3: DYNAMIC KANBAN OPTIMIZATION ---
     search_log.append("\n**STEP 3: Dynamic Kanban Monte Carlo**")
     st_log.markdown("\n".join(search_log))
     
