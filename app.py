@@ -9,11 +9,15 @@ import time
 
 st.set_page_config(page_title="DAG Factory Optimizer", layout="wide")
 
-st.title("🏭 Universal DAG Sim-Opt: Kanban & Capacities")
-st.markdown("The AI now optimizes in two dimensions: **Machine Quantities** (CAPEX) and **Kanban Buffer Limits** (WIP/Working Capital). Check the boxes to tell the AI which levers it is allowed to pull.")
+st.title("🏭 Two-Stage DAG Optimizer: Demand & Variance")
+st.markdown("This engine perfectly mimics enterprise supply chain solvers. It uses a **Static Phase** to find the cheapest machine count to meet Customer Demand, then uses a **Dynamic Phase** to optimize Kanban buffers against variance.")
 
 # --- SIDEBAR: FINANCIALS & SETTINGS ---
 with st.sidebar:
+    st.header("🎯 Customer Demand")
+    weekly_demand = st.number_input("Weekly Demand (Units)", value=250, help="Revenue is capped at this number. Overproduction burns RM cash without generating sales.")
+    
+    st.markdown("---")
     st.header("💸 Financial Economics")
     rev_unit = st.number_input("Revenue per Unit (£)", value=500.0)
     rm_cost = st.number_input("Raw Material Cost/Unit (£)", value=150.0)
@@ -22,10 +26,9 @@ with st.sidebar:
     st.markdown("---")
     st.header("⏱️ Simulation Settings")
     sim_time = st.slider("Simulation Hours", 8, 168, 40) * 60
-    eval_runs = 5   
     final_runs = 30 
     
-    run_opt = st.button("🚀 Run AI Sim-Opt Search", type="primary", use_container_width=True)
+    run_opt = st.button("🚀 Run Two-Stage Optimizer", type="primary", use_container_width=True)
 
 # --- DYNAMIC TABLES ---
 st.subheader("1️⃣ Factory Nodes (Machines, Limits & Constraints)")
@@ -39,7 +42,7 @@ default_nodes = pd.DataFrame({
     "Yield_Qty": [1, 1, 1, 1, 1, 50, 50],
     "CAPEX_Base": [0, 0, 150000, 120000, 85000, 40000, 0],
     "OPEX_Weekly": [0, 0, 2000, 2500, 3000, 1500, 0],
-    "Optimize_Qty": [False, False, True, False, True, False, False], 
+    "Optimize_Qty": [False, False, True, True, True, False, False], 
     "Optimize_Limit": [False, False, True, True, True, False, False]
 })
 
@@ -55,7 +58,7 @@ default_edges = pd.DataFrame({
 edited_edges = st.data_editor(default_edges, num_rows="dynamic", use_container_width=True)
 
 # --- CORE SIMULATION ENGINE ---
-def evaluate_network(nodes_df, edges_df, num_runs=5, return_queues=False):
+def evaluate_network(nodes_df, edges_df, num_runs=5, return_queues=False, include_variance=True):
     run_profits, run_tps, run_wips = [], [], []
     sample_q_data = []
 
@@ -65,10 +68,13 @@ def evaluate_network(nodes_df, edges_df, num_runs=5, return_queues=False):
 
     def universal_node_process(env, node_id, node_type, mean_t, std_t, yield_qty, buffers, machines):
         inputs = [(e["From_Node"], int(e["Qty_Required"])) for _, e in edges_df.iterrows() if e["To_Node"] == node_id]
+        
+        # Override variance for Phase 1
+        actual_std = std_t if include_variance else 0.0
 
         while True:
             if node_type == "Source":
-                yield env.timeout(max(0.1, random.gauss(mean_t, std_t)))
+                yield env.timeout(max(0.1, random.gauss(mean_t, actual_std)))
                 yield buffers[node_id].put(yield_qty) 
                 
             elif node_type == "Machine":
@@ -78,7 +84,7 @@ def evaluate_network(nodes_df, edges_df, num_runs=5, return_queues=False):
                 
                 with machines[node_id].request() as req:
                     yield req
-                    yield env.timeout(max(0.1, random.gauss(mean_t, std_t)))
+                    yield env.timeout(max(0.1, random.gauss(mean_t, actual_std)))
                 
                 yield buffers[node_id].put(yield_qty)
                 
@@ -123,7 +129,12 @@ def evaluate_network(nodes_df, edges_df, num_runs=5, return_queues=False):
         tp_val = sum([buffers[nid].level for nid in nodes_df[nodes_df["Type"]=="Sink"]["Node_ID"]])
         wip_val = np.mean(wip_snapshot) if wip_snapshot else 0
         
-        net_profit = (tp_val * rev_unit) - (tp_val * rm_cost) - total_opex - (wip_val * wip_cost) - weekly_depr
+        # DEMAND-CAPPED P&L MATH
+        sold_units = min(tp_val, weekly_demand)
+        wk_rev = sold_units * rev_unit
+        wk_rm = tp_val * rm_cost  # We still pay for RM even if we overproduce
+        
+        net_profit = wk_rev - wk_rm - total_opex - (wip_val * wip_cost) - weekly_depr
         
         run_profits.append(net_profit)
         run_tps.append(tp_val)
@@ -175,47 +186,67 @@ def generate_dag_vsm(nodes_df, edges_df, q_data):
             
     return dot
 
-# --- HILL CLIMBING 2D OPTIMIZER ---
+# --- TWO-STAGE OPTIMIZER ---
 if run_opt:
     with st.spinner(f"Evaluating Client Baseline ({final_runs} Runs)..."):
-        base_metrics, base_q_data = evaluate_network(edited_nodes, edited_edges, num_runs=final_runs, return_queues=True)
+        base_metrics, base_q_data = evaluate_network(edited_nodes, edited_edges, num_runs=final_runs, return_queues=True, include_variance=True)
         
     st_progress = st.empty()
     st_log = st.empty()
     
     current_nodes = edited_nodes.copy()
-    best_profit = base_metrics["profit"]
-    search_log = ["🔍 **Commencing Cached 2D Financial & Kanban Search...**"]
     
     opt_qty_idx = current_nodes[(current_nodes["Type"] == "Machine") & (current_nodes["Optimize_Qty"] == True)].index.tolist()
     opt_lim_idx = current_nodes[current_nodes["Optimize_Limit"] == True].index.tolist()
 
-    # STATE CACHE (MEMOIZATION)
-    visited_states = {}
-    def get_hash(df):
-        return hash(tuple(df["Machines_Qty"].tolist() + df["Max_WIP_Limit"].tolist()))
-    visited_states[get_hash(current_nodes)] = base_metrics
-
-    for step in range(8): 
-        st_progress.info(f"Optimization Step {step+1}: Evaluating Kanban & Capacity neighbors...")
+    # --- STAGE 1: STATIC CAPACITY PLANNING ---
+    search_log = ["**STAGE 1: Static Capacity Alignment (Ignoring Variance)**"]
+    st_log.markdown("\n".join(search_log))
+    
+    # Fast evaluation since variance = False (only need 1 run)
+    best_profit = evaluate_network(current_nodes, edited_edges, num_runs=1, include_variance=False)["profit"]
+    
+    for step in range(5):
+        st_progress.info(f"Stage 1 (Step {step+1}): Aligning machine capacities to Takt Time...")
         neighbors = []
-        
-        # Dimension 1: Search Machine Quantities
         for idx in opt_qty_idx:
             if current_nodes.at[idx, "Machines_Qty"] < 10:
                 n_df = current_nodes.copy(); n_df.at[idx, "Machines_Qty"] += 1; neighbors.append(n_df)
             if current_nodes.at[idx, "Machines_Qty"] > 1:
                 n_df = current_nodes.copy(); n_df.at[idx, "Machines_Qty"] -= 1; neighbors.append(n_df)
                 
-        # Dimension 2: Search Kanban Limits (Increments of 5)
+        found_better = False
+        for n_df in neighbors:
+            m = evaluate_network(n_df, edited_edges, num_runs=1, include_variance=False)
+            if m["profit"] > best_profit:
+                best_profit = m["profit"]
+                current_nodes = n_df
+                found_better = True
+                search_log.append(f"✅ Adjusted Capacity. Static Profit: £{m['profit']:,.0f}")
+                st_log.markdown("\n".join(search_log))
+        time.sleep(0.05)
+        if not found_better:
+            search_log.append("🛑 Machine capacities perfectly aligned with demand.")
+            st_log.markdown("\n".join(search_log))
+            break
+
+    # --- STAGE 2: DYNAMIC KANBAN OPTIMIZATION ---
+    search_log.append("\n**STAGE 2: Dynamic Kanban Limits (Absorbing Variance)**")
+    st_log.markdown("\n".join(search_log))
+    
+    # Establish new dynamic baseline with updated capacities
+    best_profit = evaluate_network(current_nodes, edited_edges, num_runs=5, include_variance=True)["profit"]
+
+    for step in range(5): 
+        st_progress.info(f"Stage 2 (Step {step+1}): Optimizing Kanban limits via Monte Carlo...")
+        neighbors = []
+        
         for idx in opt_lim_idx:
             lim = current_nodes.at[idx, "Max_WIP_Limit"]
             nid = current_nodes.at[idx, "Node_ID"]
             
-            # PREVENT DEADLOCKS: Find largest downstream batch pull. 
             pulls = edited_edges[edited_edges["From_Node"] == nid]["Qty_Required"]
-            min_req = int(pulls.max()) if not pulls.empty else 1
-            floor_limit = max(5, min_req)
+            floor_limit = max(5, int(pulls.max()) if not pulls.empty else 1)
             
             if lim < 500: 
                 n_df = current_nodes.copy(); n_df.at[idx, "Max_WIP_Limit"] = lim + 5; neighbors.append(n_df)
@@ -224,35 +255,24 @@ if run_opt:
                 
         found_better = False
         for n_df in neighbors:
-            s_hash = get_hash(n_df)
-            
-            # Check Cache before running heavy simulation
-            if s_hash in visited_states:
-                m = visited_states[s_hash]
-            else:
-                m = evaluate_network(n_df, edited_edges, num_runs=eval_runs)
-                visited_states[s_hash] = m
-                
+            m = evaluate_network(n_df, edited_edges, num_runs=5, include_variance=True)
             if m["profit"] > best_profit:
                 best_profit = m["profit"]
                 current_nodes = n_df
                 found_better = True
-                search_log.append(f"✅ Improved configuration found. Est. Profit: £{m['profit']:,.0f}/wk")
+                search_log.append(f"✅ Adjusted Buffer Limit. Dynamic Profit: £{m['profit']:,.0f}")
                 st_log.markdown("\n".join(search_log))
-                
-        # Yield process to webserver to prevent Streamlit WebSocket Timeout
         time.sleep(0.05)
-                
         if not found_better:
-            search_log.append("🛑 Local Maxima Found. Assets and Limits are financially optimal.")
+            search_log.append("🛑 Kanban buffers fully optimized.")
             st_log.markdown("\n".join(search_log))
             break
             
     st_progress.empty()
     st_log.empty()
     
-    with st.spinner(f"Verifying Optimal Configuration ({final_runs} High-Fidelity Runs)..."):
-        opt_metrics, opt_q_data = evaluate_network(current_nodes, edited_edges, num_runs=final_runs, return_queues=True)
+    with st.spinner(f"Verifying Final Configuration ({final_runs} Runs)..."):
+        opt_metrics, opt_q_data = evaluate_network(current_nodes, edited_edges, num_runs=final_runs, return_queues=True, include_variance=True)
 
     # --- UI DASHBOARDS ---
     t1, t2, t3 = st.tabs(["🏆 Gap Analysis", "🗺️ Value Stream Maps", "📈 Queue Physics"])
@@ -269,6 +289,8 @@ if run_opt:
         c2.metric("Weekly Throughput", f"{opt_metrics['tp']:.0f} units", f"{d_tp:.0f} vs Base")
         c3.metric("Avg WIP Holding", f"{opt_metrics['wip']:.0f} units", f"{d_wip:.0f} vs Base", delta_color="inverse")
         c4.metric("Total CAPEX Deployed", f"£{opt_metrics['capex']:,.0f}", f"£{d_cap:,.0f} change", delta_color="inverse")
+        
+        st.markdown(f"**Financial Note:** Weekly demand is capped at **{weekly_demand} units**. Throughput beyond this number generates zero revenue but incurs raw material and WIP holding costs.")
 
     with t2:
         v_base, v_opt = st.tabs(["📊 Baseline State", "🚀 Optimized State"])
@@ -279,7 +301,6 @@ if run_opt:
 
     with t3:
         st.subheader("Physics Verification: WIP Queues Over Time")
-        st.info("Notice how the Optimized limits force the lines to 'flatline' at their maximum capacity, completely eliminating runaway inventory spikes.")
         df_base = pd.DataFrame(base_q_data).melt(id_vars="Time (Mins)", var_name="Queue", value_name="Parts")
         df_base["State"] = "Baseline"
         df_opt = pd.DataFrame(opt_q_data).melt(id_vars="Time (Mins)", var_name="Queue", value_name="Parts")
