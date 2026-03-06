@@ -295,7 +295,7 @@ if run_opt:
     "OPEX_Weekly": [0, 0, 2000, 2500, 3000, 1500, 0],
     "Optimize_Qty": [False, False, True, False, True, False, False], 
     "Optimize_Limit": [False, False, True, True, True, False, False] # The AI can now test Kanban limits
-})
+)
 
 edited_nodes = st.data_editor(default_nodes, num_rows="dynamic", use_container_width=True)
 
